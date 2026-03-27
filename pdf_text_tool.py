@@ -15,7 +15,34 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# バリデーション
+# ---------------------------------------------------------------------------
+
+def validate_pdf_path(input_path):
+    """入力ファイルのバリデーション。問題があればエラーメッセージを返す。"""
+    input_path = Path(input_path)
+    if not input_path.exists():
+        return f"ファイルが見つかりません: {input_path}"
+    if input_path.suffix.lower() != ".pdf":
+        return f"PDFファイルではありません: {input_path.name} (拡張子: {input_path.suffix})"
+    return None
+
+
+def is_pdf_encrypted(input_path):
+    """PDFがパスワード保護されているか確認"""
+    try:
+        import pymupdf
+        doc = pymupdf.open(str(input_path))
+        encrypted = doc.is_encrypted
+        doc.close()
+        return encrypted
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -34,26 +61,33 @@ def detect_pdf_type(input_path):
     except ImportError:
         return "unknown"
 
-    doc = pymupdf.open(str(input_path))
+    try:
+        doc = pymupdf.open(str(input_path))
+    except Exception:
+        return "unknown"
+
     total_pages = len(doc)
     if total_pages == 0:
         doc.close()
         return "unknown"
 
     pages_with_text = 0
-    sample_pages = min(total_pages, 10)  # 最大10ページサンプリング
+    total_text_len = 0
+    sample_pages = min(total_pages, 10)
 
     for i in range(sample_pages):
         page = doc[i]
         text = page.get_text().strip()
-        # 1ページあたり50文字以上あればテキスト有りと判定
-        if len(text) > 50:
+        text_len = len(text)
+        total_text_len += text_len
+        # 1ページあたり10文字以上あればテキスト有りと判定
+        if text_len > 10:
             pages_with_text += 1
 
     doc.close()
 
-    # 半分以上のページにテキストがあればデジタル
-    if pages_with_text >= sample_pages * 0.5:
+    # いずれかのページにテキストがあるか、全体で20文字以上あればデジタル
+    if pages_with_text > 0 or total_text_len > 20:
         return "digital"
     return "scanned"
 
@@ -65,13 +99,6 @@ def detect_pdf_type(input_path):
 def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None):
     """
     pymupdf4llm を使用してデジタルPDFからテキスト抽出。
-
-    Args:
-        input_path: 入力PDFパス
-        output_format: "txt" or "md"
-        progress_callback: fn(message: str)
-    Returns:
-        抽出されたテキスト (str)
     """
     def log(msg):
         if progress_callback:
@@ -90,7 +117,6 @@ def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None
     md_text = pymupdf4llm.to_markdown(str(input_path))
 
     if output_format == "txt":
-        # Markdownの装飾を除去してプレーンテキストに変換
         text = _markdown_to_plain_text(md_text)
         log("テキスト変換完了")
         return text
@@ -102,13 +128,6 @@ def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None
 def extract_text_marker(input_path, output_format="txt", progress_callback=None):
     """
     marker-pdf を使用してスキャン/画像PDFから高品質OCRテキスト抽出。
-
-    Args:
-        input_path: 入力PDFパス
-        output_format: "txt" or "md"
-        progress_callback: fn(message: str)
-    Returns:
-        抽出されたテキスト (str)
     """
     def log(msg):
         if progress_callback:
@@ -143,27 +162,51 @@ def extract_text_marker(input_path, output_format="txt", progress_callback=None)
 def _markdown_to_plain_text(md_text):
     """Markdownテキストからプレーンテキストに変換"""
     text = md_text
+
+    # pymupdf4llm の画像プレースホルダーを除去
+    text = re.sub(r'==>.*?intentionally omitted\s*<==', '', text)
+    # 画像プレースホルダー（別形式）
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+
+    # コードブロック ``` ... ``` → 内容のみ残す
+    text = re.sub(r'```[^\n]*\n(.*?)```', r'\1', text, flags=re.DOTALL)
+
+    # テーブル: ヘッダー区切り行を除去
+    text = re.sub(r'^\|[-:| ]+\|\s*$', '', text, flags=re.MULTILINE)
+    # テーブル: | を除去してセル内容をタブ区切りに
+    text = re.sub(
+        r'^\|(.+)\|\s*$',
+        lambda m: '\t'.join(cell.strip() for cell in m.group(1).split('|')),
+        text, flags=re.MULTILINE
+    )
+
     # 見出しの # を除去
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # 太字・斜体の ** / * / __ / _ を除去
+
+    # 太字・斜体
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', text)
     text = re.sub(r'__(.+?)__', r'\1', text)
-    text = re.sub(r'_(.+?)_', r'\1', text)
-    # インラインコード ` を除去
+
+    # インラインコード
     text = re.sub(r'`(.+?)`', r'\1', text)
+
     # リンク [text](url) → text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    # 画像 ![alt](url) を除去
-    text = re.sub(r'!\[([^\]]*)\]\([^\)]+\)', r'\1', text)
+
     # 水平線を除去
     text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
-    # リストマーカー - / * / + を除去（行頭）
+
+    # リストマーカー
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
-    # 番号付きリストマーカーを除去
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+
+    # ブロック引用
+    text = re.sub(r'^>\s?', '', text, flags=re.MULTILINE)
+
     # 連続空行を1つに
     text = re.sub(r'\n{3,}', '\n\n', text)
+
     return text.strip()
 
 
@@ -175,18 +218,18 @@ def extract_text(input_path, engine="auto", output_format="txt",
                  progress_callback=None):
     """
     PDFからテキストを抽出する統合関数。
-
-    Args:
-        input_path: 入力PDFパス
-        engine: "auto" / "pymupdf" / "marker"
-        output_format: "txt" / "md"
-        progress_callback: fn(message: str)
-    Returns:
-        抽出されたテキスト (str)
     """
     input_path = Path(input_path)
-    if not input_path.exists():
-        raise FileNotFoundError(f"ファイルが見つかりません: {input_path}")
+
+    # バリデーション
+    err = validate_pdf_path(input_path)
+    if err:
+        raise ValueError(err)
+
+    # パスワード保護チェック
+    if is_pdf_encrypted(input_path):
+        raise ValueError(f"パスワード保護されたPDFです: {input_path.name}\n"
+                         "  パスワードを解除してから再度お試しください。")
 
     def log(msg):
         if progress_callback:
@@ -201,7 +244,6 @@ def extract_text(input_path, engine="auto", output_format="txt",
         log(f"  判定結果: {pdf_type}")
 
         if pdf_type == "scanned":
-            # marker-pdf が利用可能かチェック
             try:
                 import marker  # noqa: F401
                 engine = "marker"
@@ -214,25 +256,27 @@ def extract_text(input_path, engine="auto", output_format="txt",
             log("  → pymupdf4llm (高速) を使用します")
 
     # テキスト抽出
+    start_time = time.time()
+
     if engine == "marker":
-        return extract_text_marker(input_path, output_format, progress_callback)
+        result = extract_text_marker(input_path, output_format, progress_callback)
     else:
-        return extract_text_pymupdf(input_path, output_format, progress_callback)
+        result = extract_text_pymupdf(input_path, output_format, progress_callback)
+
+    elapsed = time.time() - start_time
+    log(f"  処理時間: {elapsed:.1f}秒")
+
+    # 結果チェック
+    if not result or not result.strip():
+        log("  警告: テキストが抽出できませんでした（空の結果）")
+
+    return result
 
 
 def extract_and_save(input_path, output_path=None, engine="auto",
                      output_format="txt", progress_callback=None):
     """
     PDFからテキストを抽出してファイルに保存。
-
-    Args:
-        input_path: 入力PDFパス
-        output_path: 出力ファイルパス (None なら自動生成)
-        engine: "auto" / "pymupdf" / "marker"
-        output_format: "txt" / "md"
-        progress_callback: fn(message: str)
-    Returns:
-        output_path (str)
     """
     input_path = Path(input_path)
 
@@ -241,17 +285,32 @@ def extract_and_save(input_path, output_path=None, engine="auto",
         output_path = input_path.with_suffix(ext)
     output_path = Path(output_path)
 
+    # 入力と出力が同一ファイルになる場合の防止
+    try:
+        if input_path.resolve() == output_path.resolve():
+            stem = input_path.stem + "_extracted"
+            ext = ".md" if output_format == "md" else ".txt"
+            output_path = input_path.with_stem(stem).with_suffix(ext)
+    except (OSError, ValueError):
+        pass
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+
     text = extract_text(
         input_path, engine=engine, output_format=output_format,
         progress_callback=progress_callback
     )
 
+    # 出力先ディレクトリの存在確認
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     output_path.write_text(text, encoding="utf-8")
 
-    def log(msg):
-        if progress_callback:
-            progress_callback(msg)
-    log(f"保存完了: {output_path.name}")
+    char_count = len(text)
+    line_count = text.count('\n') + 1 if text else 0
+    log(f"保存完了: {output_path.name} ({char_count:,}文字, {line_count:,}行)")
 
     return str(output_path)
 
@@ -264,14 +323,12 @@ def check_dependencies():
     """利用可能なエンジンを確認"""
     results = {}
 
-    # pymupdf4llm
     try:
         import pymupdf4llm  # noqa: F401
         results["pymupdf4llm"] = True
     except ImportError:
         results["pymupdf4llm"] = False
 
-    # marker-pdf
     try:
         import marker  # noqa: F401
         results["marker"] = True
@@ -318,7 +375,6 @@ def run_cli():
 
     args = parser.parse_args()
 
-    # 依存関係チェック
     if args.check:
         deps = check_dependencies()
         print("=== 依存関係チェック ===")
@@ -333,12 +389,16 @@ def run_cli():
             print("\n少なくとも1つのエンジンが利用可能です。")
             sys.exit(0)
 
-    # GUIモード
     if args.gui or args.input is None:
         run_gui()
         return
 
-    # CLI 実行
+    # 入力バリデーション
+    err = validate_pdf_path(args.input)
+    if err:
+        print(f"エラー: {err}", file=sys.stderr)
+        sys.exit(1)
+
     deps = check_dependencies()
     if not any(deps.values()):
         print("エラー: エンジンがインストールされていません。", file=sys.stderr)
@@ -378,7 +438,7 @@ def run_gui():
         def __init__(self, root):
             self.root = root
             self.root.title("PDF テキスト変換ツール")
-            self.root.geometry("720x620")
+            self.root.geometry("720x650")
             self.root.resizable(True, True)
             self.root.configure(bg="#f0f0f0")
 
@@ -458,7 +518,7 @@ def run_gui():
                 font=("Segoe UI", 10), bg="#f0f0f0"
             ).grid(row=0, column=0, sticky=tk.W, pady=2)
 
-            self.engine_var = tk.StringVar(value="auto")
+            self.engine_var = tk.StringVar(value="auto (自動判定)")
             engine_combo = ttk.Combobox(
                 settings_frame, textvariable=self.engine_var,
                 values=[
@@ -476,7 +536,7 @@ def run_gui():
                 font=("Segoe UI", 10), bg="#f0f0f0"
             ).grid(row=1, column=0, sticky=tk.W, pady=2)
 
-            self.format_var = tk.StringVar(value="txt")
+            self.format_var = tk.StringVar(value="txt (プレーンテキスト)")
             format_combo = ttk.Combobox(
                 settings_frame, textvariable=self.format_var,
                 values=["txt (プレーンテキスト)", "md (Markdown)"],
@@ -712,12 +772,12 @@ def run_gui():
             total = len(self.files)
             success = 0
             failed = 0
+            overall_start = time.time()
 
             for i, filepath in enumerate(self.files):
                 self.root.after(0, self.status_var.set,
                                 f"処理中: {i+1}/{total}")
 
-                # 出力パスを決定
                 ext = ".md" if out_format == "md" else ".txt"
                 if output_dir:
                     fname = Path(filepath).stem + ext
@@ -740,17 +800,22 @@ def run_gui():
                     self.root.after(0, self._log, f"エラー: {e}")
                     failed += 1
 
+            overall_elapsed = time.time() - overall_start
+
             def finish():
                 self.progress.stop()
                 self.run_btn.configure(state=tk.NORMAL)
                 self.processing = False
                 self.status_var.set(
-                    f"完了: 成功 {success} / 失敗 {failed} / 合計 {total}"
+                    f"完了: 成功 {success} / 失敗 {failed} / "
+                    f"合計 {total} ({overall_elapsed:.1f}秒)"
                 )
+                self._log(f"全体処理時間: {overall_elapsed:.1f}秒")
                 messagebox.showinfo(
                     "完了",
                     f"テキスト抽出が完了しました。\n"
-                    f"成功: {success}\n失敗: {failed}\n合計: {total}"
+                    f"成功: {success}\n失敗: {failed}\n合計: {total}\n"
+                    f"処理時間: {overall_elapsed:.1f}秒"
                 )
 
             self.root.after(0, finish)
