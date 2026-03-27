@@ -1,12 +1,19 @@
 """
-PDF テキスト変換ツール - PDFからテキスト/Markdownを抽出
+PDF テキスト変換ツール - PDFからテキスト/Markdown/Wordを抽出
 
-2エンジン構成:
+3エンジン構成:
   - pymupdf4llm: デジタルPDFの高速テキスト抽出（GPU不要）
+  - pdfplumber:   テーブル構造を正確に抽出（表のあるPDFに最適）
   - marker-pdf:   スキャン/画像PDFの高品質OCR抽出（PyTorch使用）
+
+出力形式:
+  - txt:  プレーンテキスト
+  - md:   Markdown
+  - docx: Word文書（見出し・表・箇条書きを構造化）
 
 使い方:
   CLI:  python pdf_text_tool.py input.pdf
+  CLI:  python pdf_text_tool.py input.pdf -f docx
   GUI:  python pdf_text_tool.py --gui
 """
 
@@ -52,9 +59,6 @@ def is_pdf_encrypted(input_path):
 def detect_pdf_type(input_path):
     """
     PDFがデジタル（テキスト埋め込み）かスキャン（画像ベース）かを判定。
-
-    Returns:
-        "digital" or "scanned"
     """
     try:
         import pymupdf
@@ -80,16 +84,79 @@ def detect_pdf_type(input_path):
         text = page.get_text().strip()
         text_len = len(text)
         total_text_len += text_len
-        # 1ページあたり10文字以上あればテキスト有りと判定
         if text_len > 10:
             pages_with_text += 1
 
     doc.close()
 
-    # いずれかのページにテキストがあるか、全体で20文字以上あればデジタル
     if pages_with_text > 0 or total_text_len > 20:
         return "digital"
     return "scanned"
+
+
+# ---------------------------------------------------------------------------
+# 構造化抽出（pdfplumber ベース）
+# ---------------------------------------------------------------------------
+
+def extract_structured(input_path, progress_callback=None):
+    """
+    pdfplumber を使って PDF の構造（テキスト・テーブル）を抽出する。
+
+    Returns:
+        list[dict]: ページごとの構造化データ
+        [
+            {
+                "page": 1,
+                "text": "ページ全体のテキスト",
+                "tables": [
+                    [["col1", "col2"], ["val1", "val2"], ...]
+                ]
+            },
+            ...
+        ]
+    """
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    try:
+        import pdfplumber
+    except ImportError:
+        raise RuntimeError(
+            "pdfplumber がインストールされていません。\n"
+            "  → pip install pdfplumber を実行してください。"
+        )
+
+    log("pdfplumber で構造化テキスト抽出中...")
+
+    pages_data = []
+    with pdfplumber.open(str(input_path)) as pdf:
+        total = len(pdf.pages)
+        for i, page in enumerate(pdf.pages):
+            if total > 5 and (i + 1) % 5 == 0:
+                log(f"  ページ {i+1}/{total} 処理中...")
+
+            text = page.extract_text() or ""
+            tables = page.extract_tables() or []
+
+            # テーブル内のNoneを空文字に変換
+            clean_tables = []
+            for table in tables:
+                clean_table = []
+                for row in table:
+                    clean_table.append([
+                        (cell or "").strip() for cell in row
+                    ])
+                clean_tables.append(clean_table)
+
+            pages_data.append({
+                "page": i + 1,
+                "text": text.strip(),
+                "tables": clean_tables,
+            })
+
+    log(f"  {len(pages_data)} ページ抽出完了")
+    return pages_data
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +164,7 @@ def detect_pdf_type(input_path):
 # ---------------------------------------------------------------------------
 
 def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None):
-    """
-    pymupdf4llm を使用してデジタルPDFからテキスト抽出。
-
-    txt形式: pymupdf4llm.to_text() で高品質プレーンテキスト出力
-    md形式:  pymupdf4llm.to_markdown() でMarkdown出力
-    """
+    """pymupdf4llm を使用してデジタルPDFからテキスト抽出。"""
     def log(msg):
         if progress_callback:
             progress_callback(msg)
@@ -117,27 +179,20 @@ def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None
 
     if output_format == "txt":
         log("pymupdf4llm.to_text() でテキスト抽出中...")
-        text = pymupdf4llm.to_text(
-            str(input_path),
-            show_progress=False,
-        )
+        text = pymupdf4llm.to_text(str(input_path), show_progress=False)
         log("テキスト変換完了")
         return text.strip()
 
     log("pymupdf4llm.to_markdown() でMarkdown抽出中...")
     md_text = pymupdf4llm.to_markdown(
-        str(input_path),
-        ignore_images=True,
-        show_progress=False,
+        str(input_path), ignore_images=True, show_progress=False
     )
     log("Markdown変換完了")
     return md_text.strip()
 
 
 def extract_text_marker(input_path, output_format="txt", progress_callback=None):
-    """
-    marker-pdf を使用してスキャン/画像PDFから高品質OCRテキスト抽出。
-    """
+    """marker-pdf を使用してスキャン/画像PDFから高品質OCRテキスト抽出。"""
     def log(msg):
         if progress_callback:
             progress_callback(msg)
@@ -171,50 +226,202 @@ def extract_text_marker(input_path, output_format="txt", progress_callback=None)
 def _markdown_to_plain_text(md_text):
     """Markdownテキストからプレーンテキストに変換（marker-pdf出力用）"""
     text = md_text
-
-    # 画像参照を除去
     text = re.sub(r'!\[([^\]]*)\]\([^\)]+\)', r'\1', text)
-
-    # コードブロック ``` ... ``` → 内容のみ残す
     text = re.sub(r'```[^\n]*\n(.*?)```', r'\1', text, flags=re.DOTALL)
-
-    # テーブル: ヘッダー区切り行を除去
     text = re.sub(r'^\|[-:| ]+\|\s*$', '', text, flags=re.MULTILINE)
-    # テーブル: | を除去してセル内容をタブ区切りに
     text = re.sub(
         r'^\|(.+)\|\s*$',
         lambda m: '\t'.join(cell.strip() for cell in m.group(1).split('|')),
         text, flags=re.MULTILINE
     )
-
-    # 見出しの # を除去
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-
-    # 太字・斜体
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'\1', text)
     text = re.sub(r'__(.+?)__', r'\1', text)
-
-    # インラインコード
     text = re.sub(r'`(.+?)`', r'\1', text)
-
-    # リンク [text](url) → text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-
-    # 水平線を除去
     text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
-
-    # リストマーカー
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-
-    # ブロック引用
     text = re.sub(r'^>\s?', '', text, flags=re.MULTILINE)
-
-    # 連続空行を1つに
     text = re.sub(r'\n{3,}', '\n\n', text)
-
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Word (.docx) 出力
+# ---------------------------------------------------------------------------
+
+def save_as_docx(pages_data, output_path, source_filename="", progress_callback=None):
+    """
+    構造化データからWord文書を生成。
+
+    Args:
+        pages_data: extract_structured() の戻り値
+        output_path: 出力 .docx パス
+        source_filename: 元PDFファイル名（ヘッダー用）
+        progress_callback: fn(message: str)
+    """
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    try:
+        from docx import Document
+        from docx.shared import Pt, Inches, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_TABLE_ALIGNMENT
+    except ImportError:
+        raise RuntimeError(
+            "python-docx がインストールされていません。\n"
+            "  → pip install python-docx を実行してください。"
+        )
+
+    log("Word文書を生成中...")
+
+    doc = Document()
+
+    # デフォルトスタイル設定
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Yu Gothic'
+    font.size = Pt(10.5)
+
+    # ソースファイル名をヘッダーに
+    if source_filename:
+        section = doc.sections[0]
+        header = section.header
+        header_para = header.paragraphs[0]
+        header_para.text = f"変換元: {source_filename}"
+        header_para.style.font.size = Pt(8)
+        header_para.style.font.color.rgb = RGBColor(128, 128, 128)
+
+    for page_data in pages_data:
+        text = page_data["text"]
+        tables = page_data["tables"]
+
+        if not text and not tables:
+            continue
+
+        # テーブルのテキストを集約（本文テキストからテーブル部分を識別するため）
+        table_cell_texts = set()
+        for table in tables:
+            for row in table:
+                for cell in row:
+                    if cell and len(cell) > 1:
+                        table_cell_texts.add(cell.strip())
+
+        # テキストを行ごとに処理
+        lines = text.split('\n') if text else []
+        i = 0
+        pending_table_idx = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if not line:
+                i += 1
+                continue
+
+            # テーブル行の検出: テーブルセルと一致する行が連続したらテーブルを挿入
+            if (pending_table_idx < len(tables) and
+                    _line_matches_table(line, tables[pending_table_idx], table_cell_texts)):
+                # テーブル挿入
+                table_data = tables[pending_table_idx]
+                _add_table_to_doc(doc, table_data)
+                pending_table_idx += 1
+
+                # テーブルに対応するテキスト行をスキップ
+                while i < len(lines):
+                    l = lines[i].strip()
+                    if l and any(cell in l for cell in table_cell_texts if cell):
+                        i += 1
+                    elif not l:
+                        i += 1
+                    else:
+                        break
+                continue
+
+            # 見出しパターンの検出
+            heading_match = re.match(
+                r'^(\d+)\.\s+(.+)$', line
+            )
+            if heading_match:
+                level = 1 if int(heading_match.group(1)) < 10 else 2
+                doc.add_heading(line, level=level)
+                i += 1
+                continue
+
+            # 箇条書きパターンの検出
+            bullet_match = re.match(r'^[●○■□▪▸▹・\-\*]\s*(.+)$', line)
+            if bullet_match:
+                para = doc.add_paragraph(bullet_match.group(1), style='List Bullet')
+                i += 1
+                continue
+
+            # 通常の段落
+            doc.add_paragraph(line)
+            i += 1
+
+        # 残りのテーブルを挿入
+        while pending_table_idx < len(tables):
+            _add_table_to_doc(doc, tables[pending_table_idx])
+            pending_table_idx += 1
+
+        # ページ区切り（最後のページ以外）
+        if page_data["page"] < len(pages_data):
+            doc.add_page_break()
+
+    doc.save(str(output_path))
+    log(f"Word文書保存完了: {Path(output_path).name}")
+
+
+def _line_matches_table(line, table, table_cell_texts):
+    """行がテーブルのヘッダー行に含まれるかチェック"""
+    if not table or not table[0]:
+        return False
+    header_cells = [c for c in table[0] if c]
+    if not header_cells:
+        return False
+    match_count = sum(1 for cell in header_cells if cell in line)
+    return match_count >= max(1, len(header_cells) // 2)
+
+
+def _add_table_to_doc(doc, table_data):
+    """Word文書にテーブルを追加"""
+    from docx.shared import Pt, RGBColor
+    from docx.oxml.ns import qn
+
+    if not table_data or not table_data[0]:
+        return
+
+    num_cols = max(len(row) for row in table_data)
+    num_rows = len(table_data)
+
+    table = doc.add_table(rows=num_rows, cols=num_cols)
+    table.style = 'Table Grid'
+
+    for r, row_data in enumerate(table_data):
+        row = table.rows[r]
+        for c, cell_text in enumerate(row_data):
+            if c < num_cols:
+                cell = row.cells[c]
+                cell.text = cell_text or ""
+                # セルのフォント設定
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(9)
+                        run.font.name = 'Yu Gothic'
+
+    # ヘッダー行を太字に
+    if table_data:
+        for c in range(num_cols):
+            cell = table.rows[0].cells[c]
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.bold = True
+
+    doc.add_paragraph()  # テーブル後にスペース
 
 
 # ---------------------------------------------------------------------------
@@ -223,17 +430,13 @@ def _markdown_to_plain_text(md_text):
 
 def extract_text(input_path, engine="auto", output_format="txt",
                  progress_callback=None):
-    """
-    PDFからテキストを抽出する統合関数。
-    """
+    """PDFからテキストを抽出する統合関数。"""
     input_path = Path(input_path)
 
-    # バリデーション
     err = validate_pdf_path(input_path)
     if err:
         raise ValueError(err)
 
-    # パスワード保護チェック
     if is_pdf_encrypted(input_path):
         raise ValueError(f"パスワード保護されたPDFです: {input_path.name}\n"
                          "  パスワードを解除してから再度お試しください。")
@@ -262,7 +465,6 @@ def extract_text(input_path, engine="auto", output_format="txt",
             engine = "pymupdf"
             log("  → pymupdf4llm (高速) を使用します")
 
-    # テキスト抽出
     start_time = time.time()
 
     if engine == "marker":
@@ -273,7 +475,6 @@ def extract_text(input_path, engine="auto", output_format="txt",
     elapsed = time.time() - start_time
     log(f"  処理時間: {elapsed:.1f}秒")
 
-    # 結果チェック
     if not result or not result.strip():
         log("  警告: テキストが抽出できませんでした（空の結果）")
 
@@ -282,13 +483,23 @@ def extract_text(input_path, engine="auto", output_format="txt",
 
 def extract_and_save(input_path, output_path=None, engine="auto",
                      output_format="txt", progress_callback=None):
-    """
-    PDFからテキストを抽出してファイルに保存。
-    """
+    """PDFからテキストを抽出してファイルに保存。"""
     input_path = Path(input_path)
 
+    # バリデーション
+    err = validate_pdf_path(input_path)
+    if err:
+        raise ValueError(err)
+
+    if is_pdf_encrypted(input_path):
+        raise ValueError(f"パスワード保護されたPDFです: {input_path.name}\n"
+                         "  パスワードを解除してから再度お試しください。")
+
+    # 出力パス決定
+    ext_map = {"txt": ".txt", "md": ".md", "docx": ".docx"}
+    ext = ext_map.get(output_format, ".txt")
+
     if output_path is None:
-        ext = ".md" if output_format == "md" else ".txt"
         output_path = input_path.with_suffix(ext)
     output_path = Path(output_path)
 
@@ -296,8 +507,7 @@ def extract_and_save(input_path, output_path=None, engine="auto",
     try:
         if input_path.resolve() == output_path.resolve():
             stem = input_path.stem + "_extracted"
-            ext = ".md" if output_format == "md" else ".txt"
-            output_path = input_path.with_stem(stem).with_suffix(ext)
+            output_path = input_path.parent / (stem + ext)
     except (OSError, ValueError):
         pass
 
@@ -305,19 +515,34 @@ def extract_and_save(input_path, output_path=None, engine="auto",
         if progress_callback:
             progress_callback(msg)
 
-    text = extract_text(
-        input_path, engine=engine, output_format=output_format,
-        progress_callback=progress_callback
-    )
+    log(f"処理開始: {input_path.name}")
 
-    # 出力先ディレクトリの存在確認
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_path.write_text(text, encoding="utf-8")
+    start_time = time.time()
 
-    char_count = len(text)
-    line_count = text.count('\n') + 1 if text else 0
-    log(f"保存完了: {output_path.name} ({char_count:,}文字, {line_count:,}行)")
+    if output_format == "docx":
+        # Word出力: pdfplumber で構造化抽出 → docx 生成
+        pages_data = extract_structured(input_path, progress_callback)
+        save_as_docx(
+            pages_data, output_path,
+            source_filename=input_path.name,
+            progress_callback=progress_callback
+        )
+    else:
+        # テキスト/Markdown出力
+        text = extract_text(
+            input_path, engine=engine, output_format=output_format,
+            progress_callback=progress_callback
+        )
+        output_path.write_text(text, encoding="utf-8")
+
+        char_count = len(text)
+        line_count = text.count('\n') + 1 if text else 0
+        log(f"保存完了: {output_path.name} ({char_count:,}文字, {line_count:,}行)")
+
+    elapsed = time.time() - start_time
+    log(f"  総処理時間: {elapsed:.1f}秒")
 
     return str(output_path)
 
@@ -327,7 +552,7 @@ def extract_and_save(input_path, output_path=None, engine="auto",
 # ---------------------------------------------------------------------------
 
 def check_dependencies():
-    """利用可能なエンジンを確認"""
+    """利用可能なエンジンと出力形式を確認"""
     results = {}
 
     try:
@@ -337,10 +562,22 @@ def check_dependencies():
         results["pymupdf4llm"] = False
 
     try:
+        import pdfplumber  # noqa: F401
+        results["pdfplumber"] = True
+    except ImportError:
+        results["pdfplumber"] = False
+
+    try:
         import marker  # noqa: F401
         results["marker"] = True
     except ImportError:
         results["marker"] = False
+
+    try:
+        import docx  # noqa: F401
+        results["python-docx"] = True
+    except ImportError:
+        results["python-docx"] = False
 
     return results
 
@@ -351,7 +588,7 @@ def check_dependencies():
 
 def run_cli():
     parser = argparse.ArgumentParser(
-        description="PDF テキスト変換ツール - PDFからテキスト/Markdownを抽出"
+        description="PDF テキスト変換ツール - PDFからテキスト/Markdown/Wordを抽出"
     )
     parser.add_argument(
         "input", nargs="?",
@@ -359,7 +596,7 @@ def run_cli():
     )
     parser.add_argument(
         "-o", "--output",
-        help="出力ファイルパス (省略時: <入力名>.txt or .md)"
+        help="出力ファイルパス (省略時: <入力名>.txt/.md/.docx)"
     )
     parser.add_argument(
         "-e", "--engine", default="auto",
@@ -368,7 +605,7 @@ def run_cli():
     )
     parser.add_argument(
         "-f", "--format", default="txt",
-        choices=["txt", "md"],
+        choices=["txt", "md", "docx"],
         help="出力形式 (デフォルト: txt)"
     )
     parser.add_argument(
@@ -388,28 +625,33 @@ def run_cli():
         for name, available in deps.items():
             status = "OK" if available else "未インストール"
             print(f"  {name}: {status}")
-        if not any(deps.values()):
-            print("\nエラー: 少なくとも1つのエンジンが必要です。")
-            print("  → pip install pymupdf4llm")
+        can_extract = deps.get("pymupdf4llm") or deps.get("pdfplumber")
+        if not can_extract:
+            print("\nエラー: 少なくとも1つの抽出エンジンが必要です。")
+            print("  → pip install pymupdf4llm pdfplumber")
             sys.exit(1)
         else:
-            print("\n少なくとも1つのエンジンが利用可能です。")
+            print("\n利用可能です。")
             sys.exit(0)
 
     if args.gui or args.input is None:
         run_gui()
         return
 
-    # 入力バリデーション
     err = validate_pdf_path(args.input)
     if err:
         print(f"エラー: {err}", file=sys.stderr)
         sys.exit(1)
 
     deps = check_dependencies()
-    if not any(deps.values()):
-        print("エラー: エンジンがインストールされていません。", file=sys.stderr)
-        print("  → pip install pymupdf4llm", file=sys.stderr)
+    if args.format == "docx" and not deps.get("python-docx"):
+        print("エラー: Word出力にはpython-docxが必要です。", file=sys.stderr)
+        print("  → pip install python-docx", file=sys.stderr)
+        sys.exit(1)
+
+    if args.format == "docx" and not deps.get("pdfplumber"):
+        print("エラー: Word出力にはpdfplumberが必要です。", file=sys.stderr)
+        print("  → pip install pdfplumber", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -445,7 +687,7 @@ def run_gui():
         def __init__(self, root):
             self.root = root
             self.root.title("PDF テキスト変換ツール")
-            self.root.geometry("720x650")
+            self.root.geometry("720x680")
             self.root.resizable(True, True)
             self.root.configure(bg="#f0f0f0")
 
@@ -459,7 +701,6 @@ def run_gui():
                 windnd.hook_dropfiles(self.root, func=self._on_drop)
 
         def _build_ui(self):
-            # --- タイトル ---
             title_frame = tk.Frame(self.root, bg="#1a5276", pady=10)
             title_frame.pack(fill=tk.X)
             tk.Label(
@@ -468,11 +709,11 @@ def run_gui():
             ).pack()
             tk.Label(
                 title_frame,
-                text="PDFからテキスト/Markdownを抽出",
+                text="PDFからテキスト/Markdown/Wordを抽出",
                 font=("Segoe UI", 9), fg="#aed6f1", bg="#1a5276"
             ).pack()
 
-            # --- ドロップエリア ---
+            # ドロップエリア
             drop_frame = tk.LabelFrame(
                 self.root, text=" PDFファイル ",
                 font=("Segoe UI", 10), padx=10, pady=5, bg="#f0f0f0"
@@ -499,34 +740,26 @@ def run_gui():
 
             btn_frame = tk.Frame(drop_frame, bg="#f0f0f0")
             btn_frame.pack(fill=tk.X)
-            ttk.Button(
-                btn_frame, text="ファイルを追加...",
-                command=self._add_files
-            ).pack(side=tk.LEFT, padx=(0, 5))
-            ttk.Button(
-                btn_frame, text="選択を削除",
-                command=self._remove_selected
-            ).pack(side=tk.LEFT, padx=(0, 5))
-            ttk.Button(
-                btn_frame, text="すべてクリア",
-                command=self._clear_files
-            ).pack(side=tk.LEFT)
+            ttk.Button(btn_frame, text="ファイルを追加...",
+                       command=self._add_files).pack(side=tk.LEFT, padx=(0, 5))
+            ttk.Button(btn_frame, text="選択を削除",
+                       command=self._remove_selected).pack(side=tk.LEFT, padx=(0, 5))
+            ttk.Button(btn_frame, text="すべてクリア",
+                       command=self._clear_files).pack(side=tk.LEFT)
 
-            # --- 設定 ---
+            # 設定
             settings_frame = tk.LabelFrame(
                 self.root, text=" 設定 ",
                 font=("Segoe UI", 10), padx=10, pady=5, bg="#f0f0f0"
             )
             settings_frame.pack(fill=tk.X, padx=15, pady=5)
 
-            # エンジン
-            tk.Label(
-                settings_frame, text="エンジン:",
-                font=("Segoe UI", 10), bg="#f0f0f0"
-            ).grid(row=0, column=0, sticky=tk.W, pady=2)
+            tk.Label(settings_frame, text="エンジン:",
+                     font=("Segoe UI", 10), bg="#f0f0f0"
+                     ).grid(row=0, column=0, sticky=tk.W, pady=2)
 
             self.engine_var = tk.StringVar(value="auto (自動判定)")
-            engine_combo = ttk.Combobox(
+            ttk.Combobox(
                 settings_frame, textvariable=self.engine_var,
                 values=[
                     "auto (自動判定)",
@@ -534,28 +767,26 @@ def run_gui():
                     "marker (高精度OCR・スキャンPDF向け)"
                 ],
                 width=35, state="readonly"
-            )
-            engine_combo.grid(row=0, column=1, sticky=tk.W, padx=10, pady=2)
+            ).grid(row=0, column=1, sticky=tk.W, padx=10, pady=2)
 
-            # 出力形式
-            tk.Label(
-                settings_frame, text="出力形式:",
-                font=("Segoe UI", 10), bg="#f0f0f0"
-            ).grid(row=1, column=0, sticky=tk.W, pady=2)
+            tk.Label(settings_frame, text="出力形式:",
+                     font=("Segoe UI", 10), bg="#f0f0f0"
+                     ).grid(row=1, column=0, sticky=tk.W, pady=2)
 
-            self.format_var = tk.StringVar(value="txt (プレーンテキスト)")
-            format_combo = ttk.Combobox(
+            self.format_var = tk.StringVar(value="docx (Word文書)")
+            ttk.Combobox(
                 settings_frame, textvariable=self.format_var,
-                values=["txt (プレーンテキスト)", "md (Markdown)"],
+                values=[
+                    "docx (Word文書)",
+                    "txt (プレーンテキスト)",
+                    "md (Markdown)",
+                ],
                 width=35, state="readonly"
-            )
-            format_combo.grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
+            ).grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
 
-            # 出力先
-            tk.Label(
-                settings_frame, text="出力先:",
-                font=("Segoe UI", 10), bg="#f0f0f0"
-            ).grid(row=2, column=0, sticky=tk.W, pady=2)
+            tk.Label(settings_frame, text="出力先:",
+                     font=("Segoe UI", 10), bg="#f0f0f0"
+                     ).grid(row=2, column=0, sticky=tk.W, pady=2)
 
             output_row = tk.Frame(settings_frame, bg="#f0f0f0")
             output_row.grid(row=2, column=1, sticky=tk.W, padx=10, pady=2)
@@ -588,23 +819,20 @@ def run_gui():
             )
             self.output_dir_btn.pack(side=tk.LEFT)
 
-            # --- 実行ボタン ---
+            # 実行ボタン
             exec_frame = tk.Frame(self.root, bg="#f0f0f0", pady=5)
             exec_frame.pack(fill=tk.X, padx=15)
 
             self.run_btn = ttk.Button(
-                exec_frame, text="テキスト抽出 実行",
+                exec_frame, text="変換実行",
                 command=self._start_extraction
             )
             self.run_btn.pack(fill=tk.X, ipady=5)
 
-            # --- プログレス ---
-            self.progress = ttk.Progressbar(
-                self.root, mode="indeterminate"
-            )
+            self.progress = ttk.Progressbar(self.root, mode="indeterminate")
             self.progress.pack(fill=tk.X, padx=15, pady=(5, 0))
 
-            # --- ログ ---
+            # ログ
             log_frame = tk.LabelFrame(
                 self.root, text=" ログ ",
                 font=("Segoe UI", 10), padx=5, pady=5, bg="#f0f0f0"
@@ -620,7 +848,6 @@ def run_gui():
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             self.log_text.pack(fill=tk.BOTH, expand=True)
 
-            # --- ステータスバー ---
             self.status_var = tk.StringVar(value="準備完了")
             tk.Label(
                 self.root, textvariable=self.status_var,
@@ -630,21 +857,14 @@ def run_gui():
 
         def _check_deps(self):
             deps = check_dependencies()
-            available = []
-            missing = []
-            for name, ok in deps.items():
-                if ok:
-                    available.append(name)
-                else:
-                    missing.append(name)
-
+            available = [n for n, ok in deps.items() if ok]
+            missing = [n for n, ok in deps.items() if not ok]
             if available:
-                self._log(f"利用可能なエンジン: {', '.join(available)}")
+                self._log(f"利用可能: {', '.join(available)}")
             if missing:
                 self._log(f"未インストール: {', '.join(missing)}")
-            if not available:
+            if not any(deps.get(e) for e in ["pymupdf4llm", "pdfplumber"]):
                 self._log("エラー: エンジンが1つもインストールされていません！")
-                self._log("  → pip install pymupdf4llm")
                 self.status_var.set("エンジン未インストール")
 
         def _log(self, msg):
@@ -698,8 +918,7 @@ def run_gui():
             self._update_drop_label()
 
         def _remove_selected(self):
-            selected = list(self.file_listbox.curselection())
-            for i in reversed(selected):
+            for i in reversed(list(self.file_listbox.curselection())):
                 self.file_listbox.delete(i)
                 del self.files[i]
             self._update_drop_label()
@@ -735,7 +954,9 @@ def run_gui():
 
         def _get_format(self):
             val = self.format_var.get()
-            if val.startswith("md"):
+            if val.startswith("docx"):
+                return "docx"
+            elif val.startswith("md"):
                 return "md"
             return "txt"
 
@@ -747,20 +968,30 @@ def run_gui():
                 return
 
             deps = check_dependencies()
-            if not any(deps.values()):
-                messagebox.showerror(
-                    "エラー",
-                    "エンジンがインストールされていません。\n"
-                    "pip install pymupdf4llm を実行してください。"
-                )
-                return
+            fmt = self._get_format()
+
+            if fmt == "docx":
+                if not deps.get("pdfplumber"):
+                    messagebox.showerror("エラー",
+                                         "Word出力にはpdfplumberが必要です。\n"
+                                         "pip install pdfplumber を実行してください。")
+                    return
+                if not deps.get("python-docx"):
+                    messagebox.showerror("エラー",
+                                         "Word出力にはpython-docxが必要です。\n"
+                                         "pip install python-docx を実行してください。")
+                    return
+            else:
+                if not any(deps.get(e) for e in ["pymupdf4llm", "pdfplumber"]):
+                    messagebox.showerror("エラー",
+                                         "エンジンがインストールされていません。\n"
+                                         "pip install pymupdf4llm を実行してください。")
+                    return
 
             if self.output_var.get() == "custom":
                 out_dir = self.output_dir_var.get()
                 if not out_dir or not os.path.isdir(out_dir):
-                    messagebox.showwarning(
-                        "警告", "出力先フォルダを選択してください。"
-                    )
+                    messagebox.showwarning("警告", "出力先フォルダを選択してください。")
                     return
 
             self.processing = True
@@ -781,11 +1012,13 @@ def run_gui():
             failed = 0
             overall_start = time.time()
 
+            ext_map = {"txt": ".txt", "md": ".md", "docx": ".docx"}
+            ext = ext_map.get(out_format, ".txt")
+
             for i, filepath in enumerate(self.files):
                 self.root.after(0, self.status_var.set,
                                 f"処理中: {i+1}/{total}")
 
-                ext = ".md" if out_format == "md" else ".txt"
                 if output_dir:
                     fname = Path(filepath).stem + ext
                     out_path = str(Path(output_dir) / fname)
@@ -820,7 +1053,7 @@ def run_gui():
                 self._log(f"全体処理時間: {overall_elapsed:.1f}秒")
                 messagebox.showinfo(
                     "完了",
-                    f"テキスト抽出が完了しました。\n"
+                    f"変換が完了しました。\n"
                     f"成功: {success}\n失敗: {failed}\n合計: {total}\n"
                     f"処理時間: {overall_elapsed:.1f}秒"
                 )
