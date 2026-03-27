@@ -12,3 +12,6 @@ venv/
 dist/
 build/
 *.egg-info/
+jpn.traineddata
+jpn_vert.traineddata
+*.traineddata

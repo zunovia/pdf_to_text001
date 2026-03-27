@@ -93,6 +93,144 @@ def detect_pdf_type(input_path):
 
 
 # ---------------------------------------------------------------------------
+# スキャンPDF用 OCR テキスト抽出 (Tesseract)
+# ---------------------------------------------------------------------------
+
+def _find_tesseract():
+    """Tesseractのパスを探す"""
+    import shutil
+    t = shutil.which("tesseract")
+    if t:
+        return t
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _find_tessdata_best():
+    """高品質 tessdata (tessdata_best) のパスを探す。なければダウンロード。"""
+    local_dir = Path(__file__).parent
+    jpn_best = local_dir / "jpn.traineddata"
+    if jpn_best.exists() and jpn_best.stat().st_size > 10_000_000:
+        return str(local_dir)
+    return None
+
+
+def ocr_scanned_pdf(input_path, progress_callback=None):
+    """
+    スキャンPDFの各ページを画像化 → 前処理 → Tesseract OCR でテキスト抽出。
+
+    見開きスキャンの場合は左右に分割して処理する。
+    """
+    import subprocess
+    import tempfile
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    try:
+        import pymupdf
+    except ImportError:
+        raise RuntimeError("pymupdf がインストールされていません。")
+
+    tesseract_path = _find_tesseract()
+    if not tesseract_path:
+        raise RuntimeError(
+            "Tesseract がインストールされていません。\n"
+            "  → https://github.com/tesseract-ocr/tesseract からインストールしてください。"
+        )
+
+    tessdata_dir = _find_tessdata_best()
+    tessdata_args = ["--tessdata-dir", tessdata_dir] if tessdata_dir else []
+
+    try:
+        from PIL import Image, ImageEnhance
+    except ImportError:
+        raise RuntimeError("Pillow がインストールされていません。\n  → pip install Pillow")
+
+    log("スキャンPDFをOCR処理中（Tesseract）...")
+
+    doc = pymupdf.open(str(input_path))
+    total = len(doc)
+    all_text = []
+
+    for i in range(total):
+        if (i + 1) % 10 == 0 or i == 0:
+            log(f"  ページ {i+1}/{total} 処理中...")
+
+        page = doc[i]
+        images = page.get_images()
+
+        if images:
+            # PDF埋め込み画像を直接抽出（高品質）
+            xref = images[0][0]
+            img_data = doc.extract_image(xref)
+            img_bytes = img_data["image"]
+            img_w = img_data["width"]
+            img_h = img_data["height"]
+
+            from io import BytesIO
+            img = Image.open(BytesIO(img_bytes))
+        else:
+            # 画像がない場合はページをレンダリング
+            pix = page.get_pixmap(dpi=300)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            img_w, img_h = img.size
+
+        # 見開き判定: 横長なら左右分割
+        is_spread = img_w > img_h * 1.3
+        if is_spread:
+            mid = img_w // 2
+            pages_to_ocr = [
+                img.crop((0, 0, mid, img_h)),       # 左ページ
+                img.crop((mid, 0, img_w, img_h)),    # 右ページ
+            ]
+        else:
+            pages_to_ocr = [img]
+
+        for sub_img in pages_to_ocr:
+            # 前処理: グレースケール → コントラスト強調 → 二値化
+            gray = sub_img.convert("L")
+            gray = ImageEnhance.Contrast(gray).enhance(2.0)
+            binary = gray.point(lambda x: 255 if x > 128 else 0, "L")
+
+            # 一時ファイルに保存してTesseractを呼び出す
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+                binary.save(tmp_path)
+
+            try:
+                result = subprocess.run(
+                    [tesseract_path, tmp_path, "stdout",
+                     "-l", "jpn", "--psm", "5"] + tessdata_args,
+                    capture_output=True, text=True, encoding="utf-8",
+                    timeout=60
+                )
+                page_text = result.stdout.strip()
+                if page_text:
+                    all_text.append(page_text)
+            except (subprocess.TimeoutExpired, Exception) as e:
+                log(f"  ページ {i+1} OCRエラー: {e}")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    doc.close()
+
+    full_text = "\n\n".join(all_text)
+    log(f"OCR完了: {len(full_text):,}文字抽出")
+    return full_text
+
+
+# ---------------------------------------------------------------------------
 # Word (.docx) 変換 — pdf2docx ライブラリ使用
 # ---------------------------------------------------------------------------
 
@@ -119,6 +257,37 @@ def convert_to_docx(input_path, output_path, progress_callback=None):
     cv.convert(str(output_path))
     cv.close()
 
+    log(f"Word文書保存完了: {Path(output_path).name}")
+
+
+def _save_text_as_docx(text, output_path, source_name="", progress_callback=None):
+    """OCR抽出テキストをシンプルなWord文書として保存。"""
+    def log(msg):
+        if progress_callback:
+            progress_callback(msg)
+
+    try:
+        from docx import Document
+        from docx.shared import Pt
+    except ImportError:
+        raise RuntimeError("python-docx がインストールされていません。\n  → pip install python-docx")
+
+    log("Word文書を生成中...")
+
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Yu Gothic'
+    style.font.size = Pt(10.5)
+
+    if source_name:
+        doc.add_heading(f"OCR変換: {source_name}", level=1)
+
+    for para_text in text.split("\n\n"):
+        para_text = para_text.strip()
+        if para_text:
+            doc.add_paragraph(para_text)
+
+    doc.save(str(output_path))
     log(f"Word文書保存完了: {Path(output_path).name}")
 
 
@@ -231,18 +400,26 @@ def extract_text(input_path, engine="auto", output_format="txt",
         log(f"  判定結果: {pdf_type}")
 
         if pdf_type == "scanned":
-            try:
-                import marker  # noqa: F401
-                engine = "marker"
-                log("  → marker-pdf (高精度OCR) を使用します")
-            except ImportError:
-                log("  → marker-pdf 未インストール。pymupdf4llm で試行します")
-                engine = "pymupdf"
+            # スキャンPDF: Tesseract OCR → marker-pdf → pymupdf4llm の順で試す
+            tesseract = _find_tesseract()
+            if tesseract:
+                engine = "tesseract"
+                log("  → Tesseract OCR を使用します")
+            else:
+                try:
+                    import marker  # noqa: F401
+                    engine = "marker"
+                    log("  → marker-pdf (高精度OCR) を使用します")
+                except ImportError:
+                    log("  → OCRエンジン未インストール。pymupdf4llm で試行します")
+                    engine = "pymupdf"
         else:
             engine = "pymupdf"
             log("  → pymupdf4llm (高速) を使用します")
 
-    if engine == "marker":
+    if engine == "tesseract":
+        return ocr_scanned_pdf(input_path, progress_callback)
+    elif engine == "marker":
         return extract_text_marker(input_path, output_format, progress_callback)
     else:
         return extract_text_pymupdf(input_path, output_format, progress_callback)
@@ -291,14 +468,15 @@ def extract_and_save(input_path, output_path=None, engine="auto",
     start_time = time.time()
 
     if output_format == "docx":
-        # スキャンPDF警告
         pdf_type = detect_pdf_type(input_path)
         if pdf_type == "scanned":
-            log("警告: スキャンPDFの可能性があります。pdf2docxはOCR非対応のため、")
-            log("  テキストが抽出できない場合があります。")
-            log("  → スキャンPDFには -f txt -e marker をお勧めします。")
-
-        convert_to_docx(input_path, output_path, progress_callback)
+            # スキャンPDF: OCR→テキスト→Word文書として保存
+            log("スキャンPDFを検出。OCRでテキスト抽出してWord出力します...")
+            text = ocr_scanned_pdf(input_path, progress_callback)
+            _save_text_as_docx(text, output_path, input_path.name, progress_callback)
+        else:
+            # デジタルPDF: pdf2docxで直接変換
+            convert_to_docx(input_path, output_path, progress_callback)
     else:
         text = extract_text(
             input_path, engine=engine, output_format=output_format,
@@ -344,6 +522,8 @@ def check_dependencies():
         results["marker"] = True
     except ImportError:
         results["marker"] = False
+
+    results["tesseract"] = _find_tesseract() is not None
 
     return results
 
