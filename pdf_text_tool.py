@@ -121,27 +121,76 @@ def _find_tessdata_best():
     return None
 
 
-def _fix_ocr_spacing(text):
-    """Tesseract OCR結果の日本語文字間に挿入される不要なスペースを除去"""
-    # 日本語文字（CJK統合漢字 + ひらがな + カタカナ + 全角記号）
-    jp = r"[\u3000-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uff00-\uffef]"
+def _postprocess_ocr_text(text):
+    """
+    OCR出力テキストの後処理:
+    1. Unicode NFKC正規化（全角英数→半角、互換文字統合）
+    2. 日本語文字間の不要スペース除去
+    3. ゴミ文字列・ノイズ除去
+    4. よくあるOCR誤字の補正
+    """
+    import unicodedata
+
+    # 1. NFKC正規化
+    text = unicodedata.normalize("NFKC", text)
+
+    # 2. 日本語文字間の不要スペース除去
+    jp = r"[\u3000-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff]"
+    punc = r"[、。！？「」『』（）・…―ー〜]"
     for _ in range(5):
         text = re.sub(f"({jp})\\s+({jp})", r"\1\2", text)
-    # 日本語文字と句読点の間のスペース
-    text = re.sub(f"({jp})\\s+([、。！？「」『』（）])", r"\1\2", text)
-    text = re.sub(f"([、。！？「」『』（）])\\s+({jp})", r"\1\2", text)
-    return text
+    text = re.sub(f"({jp})\\s+({punc})", r"\1\2", text)
+    text = re.sub(f"({punc})\\s+({jp})", r"\1\2", text)
+    text = re.sub(f"({punc})\\s+({punc})", r"\1\2", text)
+    # 日本語→英数字、英数字→日本語のスペースは1つに統一
+    text = re.sub(f"({jp})\\s{{2,}}([A-Za-z0-9])", r"\1 \2", text)
+    text = re.sub(f"([A-Za-z0-9])\\s{{2,}}({jp})", r"\1 \2", text)
+
+    # 3. ゴミ行の除去（短い意味不明な行）
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # 空行はそのまま
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+        # 2文字以下でASCII/記号のみの行をスキップ
+        if len(stripped) <= 3 and re.match(r'^[A-Za-z0-9\s|_\-=<>^*#@!&%$~`\'"]+$', stripped):
+            continue
+        # "FA", "AA", "ママ"(単独行), ページ番号のみ の除去
+        if re.match(r'^(FA|AA|ジア?\s*AA|ママ|\d{1,3})$', stripped):
+            continue
+        cleaned_lines.append(line)
+    text = "\n".join(cleaned_lines)
+
+    # 4. よくあるOCR誤字の補正
+    ocr_fixes = {
+        "でしょよう": "でしょう",
+        "のか3?": "のか?",
+        "のか3": "のか",
+    }
+    for wrong, right in ocr_fixes.items():
+        text = text.replace(wrong, right)
+
+    # 連続空行を2つまでに
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+
+    return text.strip()
 
 
 def _preprocess_for_ocr(img_bgr):
     """
-    OCR前の画像前処理パイプライン:
+    OCR前の高品質画像前処理パイプライン:
     1. グレースケール化
-    2. デノイズ (Non-local Means)
-    3. CLAHE コントラスト強調
+    2. デノイズ (Non-local Means Denoising)
+    3. CLAHE コントラスト強調 (適応的ヒストグラム均等化)
     4. 適応的二値化 (Gaussian)
+    5. 傾き補正 (Deskew)
     """
     import cv2
+    import numpy as np
+
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -150,8 +199,26 @@ def _preprocess_for_ocr(img_bgr):
         enhanced, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=31, C=10
+        blockSize=15, C=8
     )
+
+    # 傾き補正
+    coords = np.column_stack(np.where(binary < 128))
+    if len(coords) > 500:
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        if 0.3 < abs(angle) < 5:  # 0.3〜5度の傾きのみ補正
+            (ch, cw) = binary.shape[:2]
+            center = (cw // 2, ch // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            binary = cv2.warpAffine(
+                binary, M, (cw, ch),
+                flags=cv2.INTER_CUBIC, borderValue=255
+            )
+
     return binary
 
 
@@ -196,16 +263,11 @@ def ocr_scanned_pdf(input_path, progress_callback=None):
     tessdata_dir = _find_tessdata_best()
     tessdata_args = ["--tessdata-dir", tessdata_dir] if tessdata_dir else []
 
-    # jpn_vert が利用可能か確認
-    lang = "jpn_vert+jpn"
-    if tessdata_dir:
-        jpn_vert_path = Path(tessdata_dir) / "jpn_vert.traineddata"
-        if not jpn_vert_path.exists():
-            lang = "jpn"
+    lang = "jpn"
 
     log("スキャンPDFをOCR処理中...")
-    log(f"  エンジン: Tesseract (言語: {lang})")
-    log(f"  前処理: CLAHE + 適応的二値化")
+    log(f"  エンジン: Tesseract LSTM (言語: {lang})")
+    log(f"  前処理: デノイズ → CLAHE → 適応的二値化 → 傾き補正")
 
     doc = pymupdf.open(str(input_path))
     total = len(doc)
@@ -253,15 +315,17 @@ def ocr_scanned_pdf(input_path, progress_callback=None):
             try:
                 result = subprocess.run(
                     [tesseract_path, tmp_path, "stdout",
-                     "-l", lang, "--psm", "5",
-                     "-c", "preserve_interword_spaces=1"] + tessdata_args,
+                     "-l", lang,
+                     "--oem", "1",
+                     "--psm", "3",
+                     "-c", "preserve_interword_spaces=1",
+                     "-c", "textord_use_cjk_fp_model=1",
+                     ] + tessdata_args,
                     capture_output=True, text=True, encoding="utf-8",
                     timeout=120
                 )
                 page_text = result.stdout.strip()
                 if page_text:
-                    # 日本語文字間の不要スペースを除去
-                    page_text = _fix_ocr_spacing(page_text)
                     all_text.append(page_text)
             except subprocess.TimeoutExpired:
                 log(f"  ページ {i+1} タイムアウト")
@@ -276,6 +340,11 @@ def ocr_scanned_pdf(input_path, progress_callback=None):
     doc.close()
 
     full_text = "\n\n".join(all_text)
+
+    # 後処理: NFKC正規化、スペース除去、ゴミ除去、誤字補正
+    log("  後処理中（正規化・ノイズ除去・誤字補正）...")
+    full_text = _postprocess_ocr_text(full_text)
+
     log(f"OCR完了: {len(full_text):,}文字抽出")
     return full_text
 
