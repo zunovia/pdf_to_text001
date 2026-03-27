@@ -99,6 +99,9 @@ def detect_pdf_type(input_path):
 def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None):
     """
     pymupdf4llm を使用してデジタルPDFからテキスト抽出。
+
+    txt形式: pymupdf4llm.to_text() で高品質プレーンテキスト出力
+    md形式:  pymupdf4llm.to_markdown() でMarkdown出力
     """
     def log(msg):
         if progress_callback:
@@ -112,17 +115,23 @@ def extract_text_pymupdf(input_path, output_format="txt", progress_callback=None
             "  → pip install pymupdf4llm を実行してください。"
         )
 
-    log("pymupdf4llm でテキスト抽出中...")
-
-    md_text = pymupdf4llm.to_markdown(str(input_path))
-
     if output_format == "txt":
-        text = _markdown_to_plain_text(md_text)
+        log("pymupdf4llm.to_text() でテキスト抽出中...")
+        text = pymupdf4llm.to_text(
+            str(input_path),
+            show_progress=False,
+        )
         log("テキスト変換完了")
-        return text
+        return text.strip()
 
+    log("pymupdf4llm.to_markdown() でMarkdown抽出中...")
+    md_text = pymupdf4llm.to_markdown(
+        str(input_path),
+        ignore_images=True,
+        show_progress=False,
+    )
     log("Markdown変換完了")
-    return md_text
+    return md_text.strip()
 
 
 def extract_text_marker(input_path, output_format="txt", progress_callback=None):
@@ -160,13 +169,11 @@ def extract_text_marker(input_path, output_format="txt", progress_callback=None)
 
 
 def _markdown_to_plain_text(md_text):
-    """Markdownテキストからプレーンテキストに変換"""
+    """Markdownテキストからプレーンテキストに変換（marker-pdf出力用）"""
     text = md_text
 
-    # pymupdf4llm の画像プレースホルダーを除去
-    text = re.sub(r'==>.*?intentionally omitted\s*<==', '', text)
-    # 画像プレースホルダー（別形式）
-    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    # 画像参照を除去
+    text = re.sub(r'!\[([^\]]*)\]\([^\)]+\)', r'\1', text)
 
     # コードブロック ``` ... ``` → 内容のみ残す
     text = re.sub(r'```[^\n]*\n(.*?)```', r'\1', text, flags=re.DOTALL)
