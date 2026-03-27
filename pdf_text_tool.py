@@ -121,11 +121,49 @@ def _find_tessdata_best():
     return None
 
 
+def _fix_ocr_spacing(text):
+    """Tesseract OCR結果の日本語文字間に挿入される不要なスペースを除去"""
+    # 日本語文字（CJK統合漢字 + ひらがな + カタカナ + 全角記号）
+    jp = r"[\u3000-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uff00-\uffef]"
+    for _ in range(5):
+        text = re.sub(f"({jp})\\s+({jp})", r"\1\2", text)
+    # 日本語文字と句読点の間のスペース
+    text = re.sub(f"({jp})\\s+([、。！？「」『』（）])", r"\1\2", text)
+    text = re.sub(f"([、。！？「」『』（）])\\s+({jp})", r"\1\2", text)
+    return text
+
+
+def _preprocess_for_ocr(img_bgr):
+    """
+    OCR前の画像前処理パイプライン:
+    1. グレースケール化
+    2. デノイズ (Non-local Means)
+    3. CLAHE コントラスト強調
+    4. 適応的二値化 (Gaussian)
+    """
+    import cv2
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, h=10)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=31, C=10
+    )
+    return binary
+
+
 def ocr_scanned_pdf(input_path, progress_callback=None):
     """
-    スキャンPDFの各ページを画像化 → 前処理 → Tesseract OCR でテキスト抽出。
+    スキャンPDFの各ページを画像化 → 高品質前処理 → Tesseract OCR でテキスト抽出。
 
-    見開きスキャンの場合は左右に分割して処理する。
+    特徴:
+    - 見開きスキャンの自動左右分割（右→左の読み順で処理）
+    - CLAHE + 適応的二値化による高品質前処理
+    - 日本語文字間スペースの自動除去
+    - tessdata_best / zodiac3539最適化データ対応
     """
     import subprocess
     import tempfile
@@ -139,6 +177,15 @@ def ocr_scanned_pdf(input_path, progress_callback=None):
     except ImportError:
         raise RuntimeError("pymupdf がインストールされていません。")
 
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "opencv-python がインストールされていません。\n"
+            "  → pip install opencv-python-headless"
+        )
+
     tesseract_path = _find_tesseract()
     if not tesseract_path:
         raise RuntimeError(
@@ -149,73 +196,76 @@ def ocr_scanned_pdf(input_path, progress_callback=None):
     tessdata_dir = _find_tessdata_best()
     tessdata_args = ["--tessdata-dir", tessdata_dir] if tessdata_dir else []
 
-    try:
-        from PIL import Image, ImageEnhance
-    except ImportError:
-        raise RuntimeError("Pillow がインストールされていません。\n  → pip install Pillow")
+    # jpn_vert が利用可能か確認
+    lang = "jpn_vert+jpn"
+    if tessdata_dir:
+        jpn_vert_path = Path(tessdata_dir) / "jpn_vert.traineddata"
+        if not jpn_vert_path.exists():
+            lang = "jpn"
 
-    log("スキャンPDFをOCR処理中（Tesseract）...")
+    log("スキャンPDFをOCR処理中...")
+    log(f"  エンジン: Tesseract (言語: {lang})")
+    log(f"  前処理: CLAHE + 適応的二値化")
 
     doc = pymupdf.open(str(input_path))
     total = len(doc)
     all_text = []
 
     for i in range(total):
-        if (i + 1) % 10 == 0 or i == 0:
+        if (i + 1) % 5 == 0 or i == 0 or i == total - 1:
             log(f"  ページ {i+1}/{total} 処理中...")
 
         page = doc[i]
         images = page.get_images()
 
         if images:
-            # PDF埋め込み画像を直接抽出（高品質）
             xref = images[0][0]
             img_data = doc.extract_image(xref)
-            img_bytes = img_data["image"]
-            img_w = img_data["width"]
-            img_h = img_data["height"]
-
-            from io import BytesIO
-            img = Image.open(BytesIO(img_bytes))
+            nparr = np.frombuffer(img_data["image"], np.uint8)
+            img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            img_h, img_w = img_bgr.shape[:2]
         else:
-            # 画像がない場合はページをレンダリング
             pix = page.get_pixmap(dpi=300)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            img_w, img_h = img.size
+            img_bgr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.width, 3
+            )
+            img_h, img_w = img_bgr.shape[:2]
 
-        # 見開き判定: 横長なら左右分割
+        # 見開き判定: 横長なら左右分割（右→左の読み順）
         is_spread = img_w > img_h * 1.3
         if is_spread:
             mid = img_w // 2
-            pages_to_ocr = [
-                img.crop((0, 0, mid, img_h)),       # 左ページ
-                img.crop((mid, 0, img_w, img_h)),    # 右ページ
+            sub_images = [
+                img_bgr[:, mid:],     # 右ページ（先に読む）
+                img_bgr[:, :mid],     # 左ページ
             ]
         else:
-            pages_to_ocr = [img]
+            sub_images = [img_bgr]
 
-        for sub_img in pages_to_ocr:
-            # 前処理: グレースケール → コントラスト強調 → 二値化
-            gray = sub_img.convert("L")
-            gray = ImageEnhance.Contrast(gray).enhance(2.0)
-            binary = gray.point(lambda x: 255 if x > 128 else 0, "L")
+        for sub_img in sub_images:
+            # 高品質前処理
+            binary = _preprocess_for_ocr(sub_img)
 
-            # 一時ファイルに保存してTesseractを呼び出す
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
-                binary.save(tmp_path)
+                cv2.imwrite(tmp_path, binary)
 
             try:
                 result = subprocess.run(
                     [tesseract_path, tmp_path, "stdout",
-                     "-l", "jpn", "--psm", "5"] + tessdata_args,
+                     "-l", lang, "--psm", "5",
+                     "-c", "preserve_interword_spaces=1"] + tessdata_args,
                     capture_output=True, text=True, encoding="utf-8",
-                    timeout=60
+                    timeout=120
                 )
                 page_text = result.stdout.strip()
                 if page_text:
+                    # 日本語文字間の不要スペースを除去
+                    page_text = _fix_ocr_spacing(page_text)
                     all_text.append(page_text)
-            except (subprocess.TimeoutExpired, Exception) as e:
+            except subprocess.TimeoutExpired:
+                log(f"  ページ {i+1} タイムアウト")
+            except Exception as e:
                 log(f"  ページ {i+1} OCRエラー: {e}")
             finally:
                 try:
