@@ -123,60 +123,180 @@ def _find_tessdata_best():
 
 def _postprocess_ocr_text(text):
     """
-    OCR出力テキストの後処理:
-    1. Unicode NFKC正規化（全角英数→半角、互換文字統合）
+    OCR出力テキストの高品質後処理パイプライン:
+    1. Unicode NFKC正規化
     2. 日本語文字間の不要スペース除去
-    3. ゴミ文字列・ノイズ除去
-    4. よくあるOCR誤字の補正
+    3. ゴミ行・ノイズ行除去
+    4. OCR誤字の補正辞書
+    5. 文脈に基づく文章整形
+    6. 段落マージ
     """
     import unicodedata
 
-    # 1. NFKC正規化
+    # === 1. NFKC正規化 ===
     text = unicodedata.normalize("NFKC", text)
 
-    # 2. 日本語文字間の不要スペース除去
+    # === 2. 日本語文字間の不要スペース除去 ===
     jp = r"[\u3000-\u9fff\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff]"
-    punc = r"[、。！？「」『』（）・…―ー〜]"
-    for _ in range(5):
+    punc = r"[、。！？「」『』（）・…―ー〜：；]"
+    # 繰り返し適用（ネストしたスペースも除去）
+    for _ in range(8):
         text = re.sub(f"({jp})\\s+({jp})", r"\1\2", text)
     text = re.sub(f"({jp})\\s+({punc})", r"\1\2", text)
     text = re.sub(f"({punc})\\s+({jp})", r"\1\2", text)
     text = re.sub(f"({punc})\\s+({punc})", r"\1\2", text)
+    # 数字と日本語助数詞の間のスペース除去
+    text = re.sub(r"(\d)\s+(人|年|月|日|時間|分|秒|%|回|冊|個|本|件|度|万|億|千|百|歳|才|g|kg|mg|cm|m|km)", r"\1\2", text)
     # 日本語→英数字、英数字→日本語のスペースは1つに統一
     text = re.sub(f"({jp})\\s{{2,}}([A-Za-z0-9])", r"\1 \2", text)
     text = re.sub(f"([A-Za-z0-9])\\s{{2,}}({jp})", r"\1 \2", text)
 
-    # 3. ゴミ行の除去（短い意味不明な行）
+    # === 3. ゴミ行の除去 ===
     lines = text.split("\n")
     cleaned_lines = []
     for line in lines:
         stripped = line.strip()
-        # 空行はそのまま
         if not stripped:
             cleaned_lines.append("")
             continue
-        # 2文字以下でASCII/記号のみの行をスキップ
-        if len(stripped) <= 3 and re.match(r'^[A-Za-z0-9\s|_\-=<>^*#@!&%$~`\'"]+$', stripped):
+        # 日本語文字の割合が低い短い行はノイズ
+        jp_count = len(re.findall(r'[\u3040-\u9fff]', stripped))
+        total = len(stripped)
+        # 5文字以下でASCII/記号のみ → スキップ
+        if total <= 5 and jp_count == 0:
             continue
-        # "FA", "AA", "ママ"(単独行), ページ番号のみ の除去
-        if re.match(r'^(FA|AA|ジア?\s*AA|ママ|\d{1,3})$', stripped):
+        # 既知のゴミパターン
+        if re.match(r'^(FA|AA|ジア?\s*AA|ママ|人\d+|\d{1,3}|[A-Z\s]{2,6})$', stripped):
             continue
-        cleaned_lines.append(line)
+        # 短い行で日本語率が非常に低い
+        if total <= 15 and jp_count < total * 0.2 and not re.search(r'\d{2,}', stripped):
+            continue
+        # 主にASCII大文字と記号の行（表紙ノイズ）
+        if total > 10 and re.match(r'^[A-Z\s\d|_\-=<>^*#@!&%$~`\'"(){}\[\].,;:]+$', stripped):
+            continue
+        cleaned_lines.append(stripped)
     text = "\n".join(cleaned_lines)
 
-    # 4. よくあるOCR誤字の補正
+    # === 4. OCR誤字の補正辞書 ===
     ocr_fixes = {
+        # Tesseract頻出誤字
         "でしょよう": "でしょう",
+        "しましよう": "しましょう",
         "のか3?": "のか?",
-        "のか3": "のか",
+        "のか3": "のか?",
+        "ょよう": "ょう",
+        # 漢字の頻出誤変換
+        "胆内": "腸内",
+        "胆内細菌": "腸内細菌",
+        "証瓜": "証拠",
+        "織継": "繊維",
+        "秋客": "災害",
+        "鎮青": "鎮静",
+        "逮い": "遠い",
+        "貯区": "貯蓄",
+        "灘った": "減った",
+        "繁殆": "繁茂",
+        "泊って": "減って",
+        "崖築": "構築",
+        "壊減": "壊滅",
+        "拡散": "拡散",
+        "秋害": "災害",
+        "大秋": "大災",
+        "震秋": "震災",
+        "覚秋": "覚醒",
+        "本食品": "発酵食品",
+        "発本食品": "発酵食品",
+        "発本": "発酵",
+        "人和信": "信頼",
+        "和信": "信頼",
+        "大白然": "大自然",
+        "仕斑": "仕事",
+        "次質": "資質",
+        "邊き": "重き",
+        "攻い": "置い",
+        "哲想": "理想",
+        "關係": "関係",
+        "靖": "病",
+        "演け": "漬け",
+        "ぬか演": "ぬか漬",
+        "記jR": "30",
+        "啓発酵": "啓発本",
+        "ビジネス審": "ビジネス書",
+        "空具": "空虚",
+        "製われ": "襲われ",
+        "義状": "症状",
+        "腹邪": "風邪",
+        "有風邪薬": "風邪薬",
+        "軟育": "軟膏",
+        "用れた": "腫れた",
+        "不眼": "不眠",
+        "間い意志": "弱い意志",
+        "胡病": "心病",
+        "沢用": "汎用",
+        "和柔軟": "柔軟",
+        "睡訂": "睡魔",
+        "玖善": "改善",
+        "避動": "運動",
+        "心忠": "心肺",
+        "層動": "運動",
+        "政善": "改善",
+        "頭み": "頼み",
+        "豆腐": "豆腐",
+        "信頼生": "人生",
     }
     for wrong, right in ocr_fixes.items():
         text = text.replace(wrong, right)
 
-    # 連続空行を2つまでに
-    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    # === 5. パターンベースの補正 ===
+    # 「|」「1」「l」が文中に紛れたもの（Tesseractの縦線誤認識）
+    text = re.sub(r'(?<=[\u3040-\u9fff])\s*[|l]\s*(?=[\u3040-\u9fff])', '', text)
+    # 単独の「:」「;」「.」行
+    text = re.sub(r'\n[.:;]+\n', '\n', text)
+    # 文末の不正な数字（ページ番号混入）
+    text = re.sub(r'([。」])\s*\d{1,3}\s*$', r'\1', text, flags=re.MULTILINE)
+    # 先頭のゴミ数字（1~2桁の数字+スペース+日本語）
+    text = re.sub(r'^\d{1,2}\s+(?=[\u3040-\u9fff])', '', text, flags=re.MULTILINE)
+    # 文字化けブロックの除去（日本語文字が3文字以上連続しない10文字以上の行）
+    def _is_garbled(line):
+        s = line.strip()
+        if len(s) < 15:
+            return False
+        # 日本語の最長連続部分
+        jp_runs = re.findall(r'[\u3040-\u9fff]+', s)
+        max_jp_run = max((len(r) for r in jp_runs), default=0)
+        jp_total = sum(len(r) for r in jp_runs)
+        # 日本語が全体の15%未満、または最長連続が3文字未満
+        if jp_total < len(s) * 0.15 and max_jp_run < 4:
+            return True
+        return False
+    lines2 = text.split("\n")
+    text = "\n".join(l for l in lines2 if not _is_garbled(l))
 
-    return text.strip()
+    # === 6. 段落マージ（途中で切れた文の結合）===
+    merged_lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            merged_lines.append("")
+            continue
+        # 前の行が「。」「」」「!」「?」で終わらず、現在行が日本語で始まるなら結合
+        if (merged_lines
+            and merged_lines[-1]
+            and not re.search(r'[。」！？!?)\]】]$', merged_lines[-1])
+            and re.match(r'^[\u3040-\u9fff]', stripped)
+            and not re.match(r'^[・●■□▲▼△▽◆◇○※★☆]', stripped)):
+            merged_lines[-1] += stripped
+        else:
+            merged_lines.append(stripped)
+    text = "\n".join(merged_lines)
+
+    # === 7. 最終整形 ===
+    # 連続空行を2つまでに
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 先頭の空行除去
+    text = text.strip()
+
+    return text
 
 
 def _preprocess_for_ocr(img_bgr):
